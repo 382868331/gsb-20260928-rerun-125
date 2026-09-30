@@ -91,7 +91,15 @@ func Compress(ctx context.Context, w io.Writer, r io.Reader, opts Options) error
 		return err
 	}
 
-	jobs := make(chan Block, opts.Concurrency)
+	// inFlight bounds the entire read -> encode -> ordered-publish pipeline.
+	// A slot is acquired before a block is read and released only once the
+	// block has been published in sequence order, so a slow head block cannot
+	// make the reader feed unbounded blocks into workers and the pending set.
+	inFlight := make(chan struct{}, opts.Concurrency)
+	// A single-slot handoff buffer lets a worker finishing a block accept
+	// the next one before the reader reacquires its token; inFlight remains
+	// the sole bound on total blocks in the pipeline.
+	jobs := make(chan Block, 1)
 	results := make(chan resultBlock, opts.Concurrency)
 	var workers sync.WaitGroup
 	workers.Add(opts.Concurrency)
@@ -131,11 +139,14 @@ func Compress(ctx context.Context, w io.Writer, r io.Reader, opts Options) error
 			select {
 			case <-ctx.Done():
 				return
-			default:
+			case inFlight <- struct{}{}:
 			}
 
 			buf := make([]byte, opts.BlockSize)
 			n, err := io.ReadFull(r, buf)
+			if n == 0 {
+				<-inFlight
+			}
 			if n > 0 {
 				block := Block{Seq: seq, OriginalOffset: offset, Data: buf[:n]}
 				select {
@@ -159,10 +170,10 @@ func Compress(ctx context.Context, w io.Writer, r io.Reader, opts Options) error
 		}
 	}()
 
-	return collectResults(ctx, cw, results)
+	return collectResults(ctx, cw, results, inFlight)
 }
 
-func collectResults(ctx context.Context, w *countingWriter, results <-chan resultBlock) error {
+func collectResults(ctx context.Context, w *countingWriter, results <-chan resultBlock, inFlight <-chan struct{}) error {
 	entries := make([]Entry, 0)
 	pending := make(map[int]resultBlock)
 	nextSeq := 0
@@ -187,6 +198,7 @@ func collectResults(ctx context.Context, w *countingWriter, results <-chan resul
 				Codec:            next.codec,
 				Checksum:         next.checksum,
 			})
+			<-inFlight
 			nextSeq++
 			continue
 		}

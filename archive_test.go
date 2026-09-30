@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -316,3 +319,301 @@ func (futureCodec) Decode(src []byte) ([]byte, error) {
 	}
 	return dst, nil
 }
+
+func TestInFlightBoundedWhenHeadBlockSlow(t *testing.T) {
+	const concurrency = 4
+	const blockCount = 24
+	blockSize := 200
+	blocks := make([][]byte, blockCount)
+	for i := range blocks {
+		blocks[i] = make([]byte, blockSize)
+		for j := range blocks[i] {
+			blocks[i][j] = []byte{byte(i + 1), byte(i*3 + 2), byte(i*7 + 3)}[j%3]
+		}
+	}
+	blocks[blockCount-1] = blocks[blockCount-1][:37]
+
+	gate := make(chan struct{})
+	input := &chunkReader{blocks: blocks}
+	var archive frameCountingBuffer
+	codec := &trackedOrderedCodec{id: 210}
+	done := make(chan error, 1)
+	go func() {
+		done <- Compress(context.Background(), &archive, input, Options{
+			BlockSize:   blockSize,
+			Concurrency: concurrency,
+			Codecs:      []Codec{storeCodec{}, codec, gatedCodec{gate: gate, codec: codec, id: 211}},
+			Selector: func(block Block, _ []Codec) Codec {
+				if block.Seq == 0 {
+					return gatedCodec{gate: gate, codec: codec, id: 211}
+				}
+				return codec
+			},
+		})
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if input.readCount.Load() == concurrency {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := input.readCount.Load(); got != concurrency {
+		t.Fatalf("read blocks with head stalled = %d, want %d", got, concurrency)
+	}
+	close(gate)
+	if err := <-done; err != nil {
+		t.Fatalf("Compress() error = %v", err)
+	}
+	if peak := codec.peakActive.Load(); peak > concurrency {
+		t.Fatalf("peak concurrent encodes = %d, want <= %d", peak, concurrency)
+	}
+	verifyIndependentDecoding(t, archive.Bytes(), blocks, codec, gatedCodec{gate: gate, codec: codec, id: 211})
+}
+
+func TestInFlightBoundedAcrossSlowAndUnevenBlocks(t *testing.T) {
+	const concurrency = 3
+	const blockCount = 18
+	blockSize := 160
+	cases := []struct {
+		name string
+		slow int
+	}{
+		{"last block slow", blockCount - 1},
+		{"middle block slow", blockCount / 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			blocks := make([][]byte, blockCount)
+			for i := range blocks {
+				size := blockSize
+				if i == blockCount-1 {
+					size = 13
+				}
+				blocks[i] = make([]byte, size)
+				if i%3 == 0 {
+					for j := range blocks[i] {
+						blocks[i][j] = byte(i + 1)
+					}
+				} else {
+					for j := range blocks[i] {
+						blocks[i][j] = byte(i*31 + j*7)
+					}
+				}
+			}
+
+			gate := make(chan struct{})
+			input := &chunkReader{blocks: blocks}
+			var archive frameCountingBuffer
+			codec := &trackedOrderedCodec{id: 220}
+			samplerDone := make(chan struct{})
+			samplerStop := make(chan struct{})
+			var peakInFlight atomic.Int64
+			go func() {
+				defer close(samplerDone)
+				ticker := time.NewTicker(time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-samplerStop:
+						return
+					case <-ticker.C:
+						inFlight := input.readCount.Load() - archive.frames.Load()
+						for {
+							old := peakInFlight.Load()
+							if inFlight <= old || peakInFlight.CompareAndSwap(old, inFlight) {
+								break
+							}
+						}
+					}
+				}
+			}()
+
+			go func() {
+				time.Sleep(60 * time.Millisecond)
+				close(gate)
+			}()
+			err := Compress(context.Background(), &archive, input, Options{
+				BlockSize:   blockSize,
+				Concurrency: concurrency,
+				Codecs:      []Codec{storeCodec{}, codec, gatedCodec{gate: gate, codec: codec, id: 221}},
+				Selector: func(block Block, _ []Codec) Codec {
+					if block.Seq == tc.slow {
+						return gatedCodec{gate: gate, codec: codec, id: 221}
+					}
+					return codec
+				},
+			})
+			close(samplerStop)
+			<-samplerDone
+			if err != nil {
+				t.Fatalf("Compress() error = %v", err)
+			}
+			if peak := peakInFlight.Load(); peak > concurrency {
+				t.Fatalf("peak in-flight blocks = %d, want <= %d", peak, concurrency)
+			}
+			if peak := codec.peakActive.Load(); peak > concurrency {
+				t.Fatalf("peak concurrent encodes = %d, want <= %d", peak, concurrency)
+			}
+			verifyIndependentDecoding(t, archive.Bytes(), blocks, codec, gatedCodec{gate: gate, codec: codec, id: 221})
+		})
+	}
+}
+
+func TestEncodeFailureStopsPipelineAndCleansArtifact(t *testing.T) {
+	const concurrency = 2
+	errEncode := errors.New("encode exploded")
+	input := &chunkReader{blocks: makeTestBlocks(40, 128)}
+	var archive bytes.Buffer
+	failing := failingCodec{err: errEncode}
+	err := Compress(context.Background(), &archive, input, Options{
+		BlockSize:   128,
+		Concurrency: concurrency,
+		Codecs:      []Codec{storeCodec{}, failing},
+		Selector:    func(Block, []Codec) Codec { return failing },
+	})
+	if !errors.Is(err, errEncode) {
+		t.Fatalf("Compress() error = %v, want %v", err, errEncode)
+	}
+	time.Sleep(50 * time.Millisecond)
+	stalled := input.readCount.Load()
+	time.Sleep(50 * time.Millisecond)
+	if got := input.readCount.Load(); got != stalled {
+		t.Fatalf("reader kept advancing after failure: %d then %d", stalled, got)
+	}
+	if _, openErr := NewReaderFromBytes(archive.Bytes(), nil); !errors.Is(openErr, ErrBadArchive) {
+		t.Fatalf("partial archive error = %v, want ErrBadArchive", openErr)
+	}
+
+	target := filepath.Join(t.TempDir(), "archive.gcbk")
+	fileInput := &chunkReader{blocks: makeTestBlocks(40, 128)}
+	err = CompressFile(context.Background(), target, fileInput, Options{
+		BlockSize:   128,
+		Concurrency: concurrency,
+		Codecs:      []Codec{storeCodec{}, failing},
+		Selector:    func(Block, []Codec) Codec { return failing },
+	})
+	if !errors.Is(err, errEncode) {
+		t.Fatalf("CompressFile() error = %v, want %v", err, errEncode)
+	}
+	if _, statErr := os.Stat(target); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("target file after failure err = %v, want ErrNotExist", statErr)
+	}
+}
+
+func makeTestBlocks(count, size int) [][]byte {
+	blocks := make([][]byte, count)
+	for i := range blocks {
+		blocks[i] = bytes.Repeat([]byte{byte(i + 1), byte(i*7 + 2)}, (size+1)/2)[:size]
+	}
+	return blocks
+}
+
+func verifyIndependentDecoding(t *testing.T, data []byte, blocks [][]byte, extras ...Codec) {
+	t.Helper()
+	for i, want := range blocks {
+		reader, err := NewReaderFromBytes(data, extras)
+		if err != nil {
+			t.Fatalf("NewReaderFromBytes(%d) error = %v", i, err)
+		}
+		got, err := reader.ReadBlock(i)
+		if err != nil {
+			t.Fatalf("ReadBlock(%d) error = %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("ReadBlock(%d) data mismatch", i)
+		}
+	}
+}
+
+type chunkReader struct {
+	blocks    [][]byte
+	next      int
+	readCount atomic.Int64
+}
+
+func (c *chunkReader) Read(p []byte) (int, error) {
+	if c.next >= len(c.blocks) {
+		return 0, io.EOF
+	}
+	if cap(p) < len(c.blocks[c.next]) {
+		return 0, io.ErrShortBuffer
+	}
+	block := c.blocks[c.next]
+	c.next++
+	n := copy(p, block)
+	c.readCount.Add(1)
+	return n, nil
+}
+
+type frameCountingBuffer struct {
+	bytes.Buffer
+	frames atomic.Int64
+}
+
+func (b *frameCountingBuffer) Write(p []byte) (int, error) {
+	if len(p) >= 4 && binary.LittleEndian.Uint32(p[:4]) == frameMagic {
+		b.frames.Add(1)
+	}
+	return b.Buffer.Write(p)
+}
+
+type trackedOrderedCodec struct {
+	id         uint16
+	active     atomic.Int64
+	peakActive atomic.Int64
+}
+
+func (c *trackedOrderedCodec) ID() uint16   { return c.id }
+func (c *trackedOrderedCodec) Name() string { return "tracked-ordered" }
+func (c *trackedOrderedCodec) Encode(src []byte) ([]byte, error) {
+	active := c.active.Add(1)
+	defer c.active.Add(-1)
+	for {
+		peak := c.peakActive.Load()
+		if active <= peak || c.peakActive.CompareAndSwap(peak, active) {
+			break
+		}
+	}
+	dst := make([]byte, len(src))
+	copy(dst, src)
+	for i := range dst {
+		dst[i]++
+	}
+	return dst, nil
+}
+func (c *trackedOrderedCodec) Decode(src []byte) ([]byte, error) {
+	dst := make([]byte, len(src))
+	copy(dst, src)
+	for i := range dst {
+		dst[i]--
+	}
+	return dst, nil
+}
+
+type gatedCodec struct {
+	gate  <-chan struct{}
+	codec *trackedOrderedCodec
+	id    uint16
+}
+
+func (g gatedCodec) ID() uint16   { return g.id }
+func (g gatedCodec) Name() string { return "gated-ordered" }
+func (g gatedCodec) Encode(src []byte) ([]byte, error) {
+	<-g.gate
+	return g.codec.Encode(src)
+}
+func (g gatedCodec) Decode(src []byte) ([]byte, error) { return g.codec.Decode(src) }
+
+type failingCodec struct {
+	err error
+}
+
+func (failingCodec) ID() uint16   { return 212 }
+func (failingCodec) Name() string { return "failing" }
+func (c failingCodec) Encode([]byte) ([]byte, error) {
+	return nil, c.err
+}
+func (c failingCodec) Decode(src []byte) ([]byte, error) { return src, nil }
