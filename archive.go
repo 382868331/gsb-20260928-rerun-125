@@ -91,9 +91,11 @@ func Compress(ctx context.Context, w io.Writer, r io.Reader, opts Options) error
 		return err
 	}
 
-	jobs := make(chan Block, opts.Concurrency)
+	jobs := make(chan Block)
 	results := make(chan resultBlock, opts.Concurrency)
+	published := make(chan struct{}, opts.Concurrency)
 	var workers sync.WaitGroup
+	var reader sync.WaitGroup
 	workers.Add(opts.Concurrency)
 
 	for worker := 0; worker < opts.Concurrency; worker++ {
@@ -123,11 +125,23 @@ func Compress(ctx context.Context, w io.Writer, r io.Reader, opts Options) error
 		close(results)
 	}()
 
+	reader.Add(1)
 	go func() {
+		defer reader.Done()
 		defer close(jobs)
 		seq := 0
 		offset := int64(0)
+		inFlight := 0
 		for {
+			if inFlight >= opts.Concurrency {
+				select {
+				case <-ctx.Done():
+					return
+				case <-published:
+					inFlight--
+				}
+			}
+
 			select {
 			case <-ctx.Done():
 				return
@@ -143,6 +157,7 @@ func Compress(ctx context.Context, w io.Writer, r io.Reader, opts Options) error
 					return
 				case jobs <- block:
 				}
+				inFlight++
 				seq++
 				offset += int64(n)
 			}
@@ -159,10 +174,15 @@ func Compress(ctx context.Context, w io.Writer, r io.Reader, opts Options) error
 		}
 	}()
 
-	return collectResults(ctx, cw, results)
+	err := collectResults(ctx, cw, results, published)
+	if err != nil {
+		cancel()
+		reader.Wait()
+	}
+	return err
 }
 
-func collectResults(ctx context.Context, w *countingWriter, results <-chan resultBlock) error {
+func collectResults(ctx context.Context, w *countingWriter, results <-chan resultBlock, published chan<- struct{}) error {
 	entries := make([]Entry, 0)
 	pending := make(map[int]resultBlock)
 	nextSeq := 0
@@ -177,6 +197,11 @@ func collectResults(ctx context.Context, w *countingWriter, results <-chan resul
 			dataOffset := w.n
 			if err := writeFrame(w, next); err != nil {
 				return err
+			}
+			select {
+			case published <- struct{}{}:
+			case <-ctx.Done():
+				return ctx.Err()
 			}
 			entries = append(entries, Entry{
 				Seq:              next.seq,
