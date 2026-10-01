@@ -13,6 +13,11 @@ var (
 	ErrUnknownCodec    = errors.New("unknown codec")
 	ErrBlockNotFound   = errors.New("block not found")
 	ErrInvalidArgument = errors.New("invalid argument")
+	// ErrIncompatibleCheckpoint is returned when input data or encoding
+	// settings no longer match a saved checkpoint.
+	ErrIncompatibleCheckpoint = errors.New("incompatible checkpoint")
+	// ErrCheckpointNotFound is returned when no resumable state exists.
+	ErrCheckpointNotFound = errors.New("checkpoint not found")
 )
 
 type Block struct {
@@ -76,19 +81,38 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 }
 
 func Compress(ctx context.Context, w io.Writer, r io.Reader, opts Options) error {
+	cw := &countingWriter{w: w}
+	_, err := runCompression(ctx, cw, r, opts, nil)
+	return err
+}
+
+// runCompression executes the encode pipeline. When resume is nil it writes a
+// fresh archive starting with the header; otherwise it verifies the input
+// prefix against the checkpoint and continues numbering after the confirmed
+// blocks, assuming cw is already positioned at resume.DataEnd. On failure it
+// returns a checkpoint describing the confirmed progress so far.
+func runCompression(ctx context.Context, cw *countingWriter, r io.Reader, opts Options, resume *Checkpoint) (*Checkpoint, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	opts = opts.withDefaults()
-	if w == nil || r == nil || opts.BlockSize <= 0 || opts.Concurrency <= 0 || opts.Selector == nil {
-		return ErrInvalidArgument
+	if cw == nil || cw.w == nil || r == nil || opts.BlockSize <= 0 || opts.Concurrency <= 0 || opts.Selector == nil {
+		return nil, ErrInvalidArgument
 	}
 	if codecByID(opts.Codecs, CodecStore) == nil {
 		opts.Codecs = append(opts.Codecs, storeCodec{})
 	}
 
-	cw := &countingWriter{w: w}
-	if err := writeHeader(cw); err != nil {
-		return err
+	entries := make([]Entry, 0)
+	startSeq := 0
+	var startOffset int64
+	if resume == nil {
+		if err := writeHeader(cw); err != nil {
+			return nil, err
+		}
+	} else {
+		entries = append(entries, resume.Entries...)
+		startSeq = resume.NextSeq
+		startOffset = resume.NextOffset
 	}
 
 	jobs := make(chan Block)
@@ -129,8 +153,29 @@ func Compress(ctx context.Context, w io.Writer, r io.Reader, opts Options) error
 	go func() {
 		defer reader.Done()
 		defer close(jobs)
-		seq := 0
-		offset := int64(0)
+		// Re-read and verify the already published prefix without
+		// republishing it; any mismatch rejects the resume.
+		for i := 0; i < startSeq; i++ {
+			buf := make([]byte, opts.BlockSize)
+			n, readErr := io.ReadFull(r, buf)
+			entry := entries[i]
+			if n == 0 || int64(n) != entry.OriginalLength || crc32Checksum(buf[:n]) != entry.Checksum {
+				select {
+				case <-ctx.Done():
+				case results <- resultBlock{seq: startSeq, offset: startOffset, err: ErrIncompatibleCheckpoint}:
+				}
+				return
+			}
+			if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+				select {
+				case <-ctx.Done():
+				case results <- resultBlock{seq: startSeq, offset: startOffset, err: readErr}:
+				}
+				return
+			}
+		}
+		seq := startSeq
+		offset := startOffset
 		inFlight := 0
 		for {
 			if inFlight >= opts.Concurrency {
@@ -174,34 +219,57 @@ func Compress(ctx context.Context, w io.Writer, r io.Reader, opts Options) error
 		}
 	}()
 
-	err := collectResults(ctx, cw, results, published)
+	publishedEntries, nextSeq, err := collectResults(ctx, cw, results, published, entries, startSeq)
 	if err != nil {
 		cancel()
 		reader.Wait()
+		return failureCheckpoint(opts, publishedEntries, nextSeq, err), err
 	}
-	return err
+	return nil, nil
 }
 
-func collectResults(ctx context.Context, w *countingWriter, results <-chan resultBlock, published chan<- struct{}) error {
-	entries := make([]Entry, 0)
+func failureCheckpoint(opts Options, entries []Entry, nextSeq int, cause error) *Checkpoint {
+	dataEnd := int64(headerSize)
+	var nextOffset int64
+	if len(entries) > 0 {
+		last := entries[len(entries)-1]
+		dataEnd = last.DataOffset + last.CompressedLength
+		nextOffset = last.OriginalOffset + last.OriginalLength
+	}
+	reason := "interrupted"
+	if cause != nil {
+		reason = cause.Error()
+	}
+	return &Checkpoint{
+		Version:    checkpointVersion,
+		BlockSize:  opts.BlockSize,
+		CodecIDs:   codecIDs(opts.Codecs),
+		Entries:    entries,
+		NextSeq:    nextSeq,
+		NextOffset: nextOffset,
+		DataEnd:    dataEnd,
+		Reason:     reason,
+	}
+}
+
+func collectResults(ctx context.Context, w *countingWriter, results <-chan resultBlock, published chan<- struct{}, entries []Entry, nextSeq int) ([]Entry, int, error) {
 	pending := make(map[int]resultBlock)
-	nextSeq := 0
 
 	for {
 		if next, ok := pending[nextSeq]; ok {
 			delete(pending, nextSeq)
 			if next.err != nil {
-				return next.err
+				return entries, nextSeq, next.err
 			}
 
 			dataOffset := w.n
 			if err := writeFrame(w, next); err != nil {
-				return err
+				return entries, nextSeq, err
 			}
 			select {
 			case published <- struct{}{}:
 			case <-ctx.Done():
-				return ctx.Err()
+				return entries, nextSeq, ctx.Err()
 			}
 			entries = append(entries, Entry{
 				Seq:              next.seq,
@@ -218,21 +286,21 @@ func collectResults(ctx context.Context, w *countingWriter, results <-chan resul
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return entries, nextSeq, ctx.Err()
 		case result, ok := <-results:
 			if !ok {
 				indexOffset := w.n
 				indexChecksum, err := writeIndex(w, entries)
 				if err != nil {
-					return err
+					return entries, nextSeq, err
 				}
-				return writeFooter(w, entries, indexOffset, indexChecksum)
+				return entries, nextSeq, writeFooter(w, entries, indexOffset, indexChecksum)
 			}
 			if result.err != nil {
-				return result.err
+				return entries, nextSeq, result.err
 			}
 			if _, exists := pending[result.seq]; exists {
-				return ErrBadArchive
+				return entries, nextSeq, ErrBadArchive
 			}
 			pending[result.seq] = result
 		}

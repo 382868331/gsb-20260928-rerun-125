@@ -135,9 +135,12 @@ func (r *Reader) ReadBlock(seq int) ([]byte, error) {
 	if seq < 0 || seq >= len(r.entries) {
 		return nil, ErrBlockNotFound
 	}
-	entry := r.entries[seq]
+	return decodeFrame(r.r, r.codecs, r.entries[seq])
+}
+
+func decodeFrame(r io.ReaderAt, codecs map[uint16]Codec, entry Entry) ([]byte, error) {
 	frame := make([]byte, entry.CompressedLength)
-	if _, err := r.r.ReadAt(frame, entry.DataOffset); err != nil {
+	if _, err := r.ReadAt(frame, entry.DataOffset); err != nil {
 		return nil, err
 	}
 	if binary.LittleEndian.Uint32(frame[:4]) != frameMagic {
@@ -153,7 +156,7 @@ func (r *Reader) ReadBlock(seq int) ([]byte, error) {
 		return nil, fmt.Errorf("%w: frame metadata", ErrBadArchive)
 	}
 
-	codec := r.codecs[entry.Codec]
+	codec := codecs[entry.Codec]
 	if codec == nil {
 		return nil, fmt.Errorf("%w: codec %d", ErrUnknownCodec, entry.Codec)
 	}
