@@ -8,11 +8,13 @@ import (
 )
 
 var (
-	ErrBadArchive      = errors.New("invalid archive")
-	ErrBadChecksum     = errors.New("archive checksum mismatch")
-	ErrUnknownCodec    = errors.New("unknown codec")
-	ErrBlockNotFound   = errors.New("block not found")
-	ErrInvalidArgument = errors.New("invalid argument")
+	ErrBadArchive        = errors.New("invalid archive")
+	ErrBadChecksum       = errors.New("archive checksum mismatch")
+	ErrUnknownCodec      = errors.New("unknown codec")
+	ErrBlockNotFound     = errors.New("block not found")
+	ErrInvalidArgument   = errors.New("invalid argument")
+	ErrIncompatibleState = errors.New("incompatible checkpoint state")
+	ErrIncomplete        = errors.New("archive incomplete")
 )
 
 type Block struct {
@@ -76,6 +78,28 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 }
 
 func Compress(ctx context.Context, w io.Writer, r io.Reader, opts Options) error {
+	return runPipeline(ctx, w, r, opts, nil, nil)
+}
+
+// CompressWithCheckpoint behaves like Compress but reports a Checkpoint after
+// every confirmed block publish and once more (marked interrupted) if the run
+// fails, so a later Resume can continue from the confirmed prefix.
+func CompressWithCheckpoint(ctx context.Context, w io.Writer, r io.Reader, opts Options, save func(Checkpoint) error) error {
+	return runPipeline(ctx, w, r, opts, nil, save)
+}
+
+// Resume continues an interrupted run. The checkpoint is validated against
+// opts (format version, block size and codec set must match), the confirmed
+// input prefix is re-read from r and verified against the recorded checksums,
+// and encoding continues from the first unconfirmed block. Already published
+// frames are never rewritten: w must be positioned at cp.OutputOffset and r
+// must yield the original input from the beginning. Any incompatibility
+// rejects the resume before anything is written.
+func Resume(ctx context.Context, w io.Writer, r io.Reader, opts Options, cp Checkpoint, save func(Checkpoint) error) error {
+	return runPipeline(ctx, w, r, opts, &cp, save)
+}
+
+func runPipeline(ctx context.Context, w io.Writer, r io.Reader, opts Options, cp *Checkpoint, hook func(Checkpoint) error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	opts = opts.withDefaults()
@@ -86,9 +110,37 @@ func Compress(ctx context.Context, w io.Writer, r io.Reader, opts Options) error
 		opts.Codecs = append(opts.Codecs, storeCodec{})
 	}
 
-	cw := &countingWriter{w: w}
-	if err := writeHeader(cw); err != nil {
-		return err
+	entries := make([]Entry, 0)
+	startSeq := 0
+	startOffset := int64(0)
+	startWritten := int64(0)
+	if cp != nil {
+		if err := cp.validate(opts); err != nil {
+			return err
+		}
+		if err := verifyPrefix(r, cp.Entries); err != nil {
+			return err
+		}
+		entries = append(entries, cp.Entries...)
+		startSeq = len(cp.Entries)
+		startOffset = cp.InputOffset
+		startWritten = cp.OutputOffset
+	}
+
+	cw := &countingWriter{w: w, n: startWritten}
+	if cp == nil {
+		if err := writeHeader(cw); err != nil {
+			return err
+		}
+	}
+	snapshot := func(interrupted bool, cause error) Checkpoint {
+		return newCheckpoint(opts, entries, cw.n, interrupted, cause)
+	}
+	fail := func(cause error) error {
+		if hook != nil {
+			_ = hook(snapshot(true, cause))
+		}
+		return cause
 	}
 
 	jobs := make(chan Block)
@@ -129,8 +181,8 @@ func Compress(ctx context.Context, w io.Writer, r io.Reader, opts Options) error
 	go func() {
 		defer reader.Done()
 		defer close(jobs)
-		seq := 0
-		offset := int64(0)
+		seq := startSeq
+		offset := startOffset
 		inFlight := 0
 		for {
 			if inFlight >= opts.Concurrency {
@@ -174,36 +226,42 @@ func Compress(ctx context.Context, w io.Writer, r io.Reader, opts Options) error
 		}
 	}()
 
-	err := collectResults(ctx, cw, results, published)
+	entries, err := collectResults(ctx, cw, entries, results, published, func(entry Entry) error {
+		if hook == nil {
+			return nil
+		}
+		return hook(snapshot(false, nil))
+	})
 	if err != nil {
 		cancel()
 		reader.Wait()
+		return fail(err)
 	}
-	return err
+
+	indexOffset := cw.n
+	indexChecksum, err := writeIndex(cw, entries)
+	if err != nil {
+		return fail(err)
+	}
+	return writeFooter(cw, entries, indexOffset, indexChecksum)
 }
 
-func collectResults(ctx context.Context, w *countingWriter, results <-chan resultBlock, published chan<- struct{}) error {
-	entries := make([]Entry, 0)
+func collectResults(ctx context.Context, w *countingWriter, entries []Entry, results <-chan resultBlock, published chan<- struct{}, onPublish func(Entry) error) ([]Entry, error) {
 	pending := make(map[int]resultBlock)
-	nextSeq := 0
+	nextSeq := len(entries)
 
 	for {
 		if next, ok := pending[nextSeq]; ok {
 			delete(pending, nextSeq)
 			if next.err != nil {
-				return next.err
+				return entries, next.err
 			}
 
 			dataOffset := w.n
 			if err := writeFrame(w, next); err != nil {
-				return err
+				return entries, err
 			}
-			select {
-			case published <- struct{}{}:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			entries = append(entries, Entry{
+			entry := Entry{
 				Seq:              next.seq,
 				OriginalOffset:   next.offset,
 				OriginalLength:   int64(len(next.data)),
@@ -211,28 +269,34 @@ func collectResults(ctx context.Context, w *countingWriter, results <-chan resul
 				CompressedLength: int64(frameHeaderSize + len(next.payload)),
 				Codec:            next.codec,
 				Checksum:         next.checksum,
-			})
+			}
+			entries = append(entries, entry)
+			if onPublish != nil {
+				if err := onPublish(entry); err != nil {
+					return entries, err
+				}
+			}
+			select {
+			case published <- struct{}{}:
+			case <-ctx.Done():
+				return entries, ctx.Err()
+			}
 			nextSeq++
 			continue
 		}
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return entries, ctx.Err()
 		case result, ok := <-results:
 			if !ok {
-				indexOffset := w.n
-				indexChecksum, err := writeIndex(w, entries)
-				if err != nil {
-					return err
-				}
-				return writeFooter(w, entries, indexOffset, indexChecksum)
+				return entries, nil
 			}
 			if result.err != nil {
-				return result.err
+				return entries, result.err
 			}
 			if _, exists := pending[result.seq]; exists {
-				return ErrBadArchive
+				return entries, ErrBadArchive
 			}
 			pending[result.seq] = result
 		}

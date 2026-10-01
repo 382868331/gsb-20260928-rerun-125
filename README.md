@@ -40,3 +40,11 @@ footer
 ## 并行与一致性
 
 压缩 worker 数量由 `Options.Concurrency` 控制；从读取、编码到等待按序发布的整个在途窗口都以并发度为上限。结果可乱序完成，但收集器严格按原始块序号发布，块发布后才允许读取后续输入。上下文取消、读取失败、编码失败或写入失败都会停止管线，不写索引和页脚；文件输出也不会重命名，并会移除未发布完成的临时文件。
+
+## 断点续传
+
+`CompressWithCheckpoint` 在每个块确认发布后回调一次 `Checkpoint`；`CompressFileResumable` 把进度落盘到 `目标.partial` 与 `目标.checkpoint`，中断时两者都保留作为现场证据。`Resume` / `ResumeFile` 校验检查点（格式版本、块大小、编码器集合的指纹）并重读已确认输入前缀逐块核对 CRC，输入内容或编码设置变化会在写入任何输出前以 `ErrIncompatibleState` 拒绝，原输出与检查点保持不动。确认后的续传只追加新帧，不重发已发布前缀；恢复时可以使用不同的 `Concurrency`，最终内容与一次完整编码解码一致。
+
+## 部分输出读取
+
+`NewPartialReader` 不需要页脚：从头部顺序扫描数据帧，逐帧解码并校验 CRC 后才计入已确认块。`Entries` 只包含完整可用的块，`ConfirmedOffset` 给出已确认的原始字节数，`TailError` 说明尾部为何不可用（`ErrIncomplete` 表示截断，`ErrBadChecksum`/`ErrBadArchive` 表示损坏）；截断或损坏的尾部永远不会被当成完成。存在合法索引和页脚且与逐帧扫描结果一致时 `Complete` 为真。

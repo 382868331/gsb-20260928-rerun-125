@@ -415,16 +415,21 @@ func (w *trackingWriter) Write(p []byte) (int, error) {
 }
 
 type blockReader struct {
-	blocks  [][]byte
-	index   int
-	tracker *backlogTracker
+	blocks    [][]byte
+	index     int
+	tracker   *backlogTracker
+	untracked int
 }
 
 func (r *blockReader) Read(p []byte) (int, error) {
 	if r.index >= len(r.blocks) {
 		return 0, io.EOF
 	}
-	r.tracker.enter()
+	if r.untracked > 0 {
+		r.untracked--
+	} else {
+		r.tracker.enter()
+	}
 	n := copy(p, r.blocks[r.index])
 	r.index++
 	return n, nil

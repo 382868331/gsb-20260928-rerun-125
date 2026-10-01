@@ -135,34 +135,5 @@ func (r *Reader) ReadBlock(seq int) ([]byte, error) {
 	if seq < 0 || seq >= len(r.entries) {
 		return nil, ErrBlockNotFound
 	}
-	entry := r.entries[seq]
-	frame := make([]byte, entry.CompressedLength)
-	if _, err := r.r.ReadAt(frame, entry.DataOffset); err != nil {
-		return nil, err
-	}
-	if binary.LittleEndian.Uint32(frame[:4]) != frameMagic {
-		return nil, fmt.Errorf("%w: frame magic", ErrBadArchive)
-	}
-	if binary.LittleEndian.Uint16(frame[4:6]) != entry.Codec {
-		return nil, fmt.Errorf("%w: codec mismatch", ErrBadArchive)
-	}
-	originalLength := int64(binary.LittleEndian.Uint64(frame[8:16]))
-	compressedLength := int64(binary.LittleEndian.Uint64(frame[16:24]))
-	checksum := binary.LittleEndian.Uint32(frame[24:28])
-	if originalLength != entry.OriginalLength || compressedLength != entry.CompressedLength-frameHeaderSize || checksum != entry.Checksum {
-		return nil, fmt.Errorf("%w: frame metadata", ErrBadArchive)
-	}
-
-	codec := r.codecs[entry.Codec]
-	if codec == nil {
-		return nil, fmt.Errorf("%w: codec %d", ErrUnknownCodec, entry.Codec)
-	}
-	decoded, err := codec.Decode(frame[frameHeaderSize:])
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(decoded)) != originalLength || crc32Checksum(decoded) != checksum {
-		return nil, ErrBadChecksum
-	}
-	return decoded, nil
+	return readBlockAt(r.r, r.codecs, r.entries[seq])
 }
